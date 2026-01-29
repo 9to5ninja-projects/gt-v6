@@ -36,3 +36,6 @@ matplotlib
 # Optional: for Jupyter/IPython
 ipython
 jupyter
+datasets
+transformers
+tqdm
