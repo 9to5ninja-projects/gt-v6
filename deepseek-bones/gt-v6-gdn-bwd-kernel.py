@@ -1,3 +1,27 @@
+
+# Forward: S_t = g_t * S_{t-1} + beta_t * (v_t - S_{t-1} @ k_t) ⊗ k_t
+# Output: out_t = S_t @ k_t
+#
+# Gradients:
+#   dL/dv_t = beta_t * (dL/dS_t) @ k_t
+#   dL/dbeta_t = (dL/dS_t) : (k_t ⊗ error_t)
+#   dL/dg_t = (dL/dS_t) : S_{t-1}
+#   dL/dk_t = complex (3 terms): 
+#     1. From output: dout_t @ S_t
+#     2. From state update: beta_t * (dL/dS_t) @ error_t
+#     3. From prediction: -beta_t * k_t * (k_t @ dL/dS_t @ k_t)
+#   dL/dS_{t-1} = g_t * dL/dS_t - beta_t * k_t ⊗ (dL/dS_t @ k_t)
+#
+# Simple forward-backward
+# output, final_state = delta_rule_autograd(k, v, beta, g, initial_state)
+#
+# Compute loss
+# loss = output.sum() + final_state.sum()
+#
+# Backward - automatically computes all gradients
+# loss.backward()
+#
+# Gradients are now in k.grad, v.grad, beta.grad, g.grad, initial_state.grad
 # =============================================================================
 # DELTA RULE BACKWARD KERNEL - Full Gradient Implementation
 # =============================================================================

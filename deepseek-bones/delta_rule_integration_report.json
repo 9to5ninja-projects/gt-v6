@@ -1,0 +1,205 @@
+{
+  "test_suite": {
+    "kernel_correctness": {
+      "output_abs_error": 2.384185791015625e-07,
+      "output_rel_error": 7.635301813024853e-08,
+      "state_abs_error": 5.960464477539063e-08,
+      "state_rel_error": 8.212324331680065e-08,
+      "passed": true,
+      "config": {
+        "B": 2,
+        "T": 64,
+        "H": 4,
+        "K": 32,
+        "V": 64
+      }
+    },
+    "performance": {
+      "B=4,T=64,H=8,K=32,V=64": {
+        "pytorch_ms": 10.501050200036843,
+        "triton_ms": 0.09442874979868066,
+        "speedup": 111.20607042267082,
+        "config": {
+          "B": 4,
+          "T": 64,
+          "H": 8,
+          "K": 32,
+          "V": 64
+        }
+      },
+      "B=8,T=128,H=8,K=32,V=64": {
+        "pytorch_ms": 17.540566100069555,
+        "triton_ms": 0.27909269992960617,
+        "speedup": 62.8485306297646,
+        "config": {
+          "B": 8,
+          "T": 128,
+          "H": 8,
+          "K": 32,
+          "V": 64
+        }
+      },
+      "B=8,T=256,H=8,K=32,V=64": {
+        "pytorch_ms": 31.68929505009146,
+        "triton_ms": 0.5472815002576681,
+        "speedup": 57.90309929199449,
+        "config": {
+          "B": 8,
+          "T": 256,
+          "H": 8,
+          "K": 32,
+          "V": 64
+        }
+      },
+      "B=16,T=128,H=8,K=32,V=64": {
+        "pytorch_ms": 14.64582974986115,
+        "triton_ms": 0.47998410009313375,
+        "speedup": 30.513156054584613,
+        "config": {
+          "B": 16,
+          "T": 128,
+          "H": 8,
+          "K": 32,
+          "V": 64
+        }
+      }
+    },
+    "gradient_flow": {
+      "x_has_grad": true,
+      "x_grad_norm": 26456463769600.0,
+      "k_proj_has_grad": true,
+      "v_proj_has_grad": true,
+      "no_nan_in_grads": true,
+      "no_inf_in_grads": true,
+      "passed": true
+    },
+    "memory_behavior": {
+      "initial_memory_mb": 17.25,
+      "peak_memory_mb": 37.75,
+      "final_memory_mb": 29.5,
+      "memory_increase_mb": 20.5,
+      "sequence_length": 1024,
+      "total_elements": 3211264
+    }
+  },
+  "integration": {
+    "forward_passes": [
+      {
+        "step": 0,
+        "time_ms": 55.43851199763594,
+        "output_shape": [
+          4,
+          128,
+          256
+        ],
+        "state_shape": [
+          4,
+          8,
+          32,
+          64
+        ],
+        "output_mean": -0.00186547904741019,
+        "output_std": 0.999517560005188
+      },
+      {
+        "step": 1,
+        "time_ms": 1.112775004003197,
+        "output_shape": [
+          4,
+          128,
+          256
+        ],
+        "state_shape": [
+          4,
+          8,
+          32,
+          64
+        ],
+        "output_mean": 0.0035618646070361137,
+        "output_std": 1.0056030750274658
+      },
+      {
+        "step": 2,
+        "time_ms": 1.8544269987614825,
+        "output_shape": [
+          4,
+          128,
+          256
+        ],
+        "state_shape": [
+          4,
+          8,
+          32,
+          64
+        ],
+        "output_mean": 0.003345823148265481,
+        "output_std": 1.0009162425994873
+      },
+      {
+        "step": 3,
+        "time_ms": 5.153597005119082,
+        "output_shape": [
+          4,
+          128,
+          256
+        ],
+        "state_shape": [
+          4,
+          8,
+          32,
+          64
+        ],
+        "output_mean": 0.003556689480319619,
+        "output_std": 1.0015454292297363
+      },
+      {
+        "step": 4,
+        "time_ms": 3.133930003968999,
+        "output_shape": [
+          4,
+          128,
+          256
+        ],
+        "state_shape": [
+          4,
+          8,
+          32,
+          64
+        ],
+        "output_mean": 0.0004155125352554023,
+        "output_std": 1.0025293827056885
+      }
+    ],
+    "memory_usage": [],
+    "state_consistency": true,
+    "peak_memory_mb": 37.75
+  },
+  "comparison": {
+    "triton_time_ms": 0.6990191501245135,
+    "reference_time_ms": 0.8302351998281665,
+    "speedup": 1.1877145278212764,
+    "output_max_diff": 0.0,
+    "state_max_diff": 0.0,
+    "outputs_match": true,
+    "states_match": true
+  },
+  "summary": {
+    "all_tests_passed": true,
+    "kernel_correctness": true,
+    "gradient_flow": true,
+    "performance_tested": true,
+    "memory_tested": true,
+    "timestamp": "2026-01-30 20:38:26",
+    "device": "cuda",
+    "triton_version": "3.6.0",
+    "torch_version": "2.11.0.dev20260128+cu128",
+    "cuda_version": "12.8"
+  },
+  "environment": {
+    "pytorch": "2.11.0.dev20260128+cu128",
+    "cuda": "12.8",
+    "triton": "3.6.0",
+    "gpu": "NVIDIA GeForce RTX 4050 Laptop GPU",
+    "timestamp": "2026-01-30 20:38:26"
+  }
+}
