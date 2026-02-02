@@ -1,3 +1,6 @@
+# For notebook tqdm compatibility
+jupyter
+ipywidgets
 anyio==4.12.1
 asttokens==3.0.1
 certifi==2026.1.4
