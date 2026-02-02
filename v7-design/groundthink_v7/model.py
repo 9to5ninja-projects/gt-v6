@@ -224,13 +224,14 @@ class GatedDeltaNetLayer(nn.Module):
         # L2 normalize keys
         k = F.normalize(k.float(), p=2, dim=-1).to(x.dtype)
         
-        # Initialize state
+        # Initialize state - ALWAYS FP32 for SSM stability (per references)
+        # Even under AMP, accumulating state needs higher precision
         if initial_state is None:
-            state = torch.zeros(B, H, K, V, device=x.device, dtype=x.dtype)
+            state = torch.zeros(B, H, K, V, device=x.device, dtype=torch.float32)
         else:
-            state = initial_state.to(x.dtype)
+            state = initial_state.to(torch.float32)
         
-        # Chunk-recurrent Delta Rule
+        # Chunk-recurrent Delta Rule (operates in FP32 for state)
         out, new_state = chunk_delta_rule(k, v, beta, g, state, self.cfg.chunk_size)
         
         if self.use_shifted_value and T > 1:
@@ -248,6 +249,7 @@ class GatedDeltaNetLayer(nn.Module):
         diag = {
             'beta_mean': beta.mean().item(),
             'beta_max': beta.max().item(),
+            'cached_keys': k_full,  # Cache the ACTUAL computed keys for SWA to use
             'g_mean': g.mean().item(),
             'state_norm': new_state.norm().item(),
             'n_markers': n_markers,
@@ -317,7 +319,7 @@ class SlidingWindowAttention(nn.Module):
         gdn_state: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         key_bank: Optional[torch.Tensor] = None,
-        gdn_k_proj: Optional[nn.Linear] = None  # SHARED key projection from GDN
+        gdn_cached_keys: Optional[torch.Tensor] = None  # CACHED keys from GDN (computed on GDN's x)
     ) -> Tuple[torch.Tensor, Dict]:
         """
         Args:
@@ -325,7 +327,7 @@ class SlidingWindowAttention(nn.Module):
             gdn_state: [B, H, K, V] state from GDN layers
             input_ids: [B, T] token IDs for CUE detection
             key_bank: [H, bank_size, K] orthogonal keys from GDN
-            gdn_k_proj: GDN's key projection - SHARED for aligned queries
+            gdn_cached_keys: [B, T, H, K] ACTUAL keys GDN computed (not a projection to apply)
             
         Returns:
             output: [B, T, D]
@@ -381,11 +383,11 @@ class SlidingWindowAttention(nn.Module):
         n_cue_queries = 0
         
         if gdn_state is not None:
-            # Generate queries using SHARED key projection (aligns with GDN writes)
-            if gdn_k_proj is not None:
-                q_g = gdn_k_proj(x_norm).view(B, T, H, K)  # ALIGNED with GDN keys
+            # Use CACHED keys from GDN directly - these are the actual keys GDN wrote with
+            if gdn_cached_keys is not None:
+                q_g = gdn_cached_keys  # [B, T, H, K] - EXACT keys GDN used, perfectly aligned
             else:
-                q_g = self.global_q_proj(x_norm).view(B, T, H, K)  # Fallback
+                q_g = self.global_q_proj(x_norm).view(B, T, H, K)  # Fallback (won't align)
             
             # For CUE tokens, use orthogonal bank keys as queries
             # CUE_0 (token 250) → slot 0, CUE_1 (251) → slot 1, etc.
@@ -424,6 +426,179 @@ class SlidingWindowAttention(nn.Module):
         return out, diag
 
 
+class ParallelHybridLayer(nn.Module):
+    """
+    Parallel GDN + SWA in SAME layer (Hymba-style fusion).
+    
+    Both GDN and SWA see the SAME input x, so shared_key_proj(x) produces
+    identical keys for writes and queries. This guarantees alignment.
+    
+    Information Flow:
+        x_norm = norm(x)
+        gdn_out, state = GDN(x_norm)  # Updates state with k=shared_key_proj(x_norm)
+        swa_out = SWA(x_norm, state)   # Queries with q=shared_key_proj(x_norm)
+        out = x + gdn_out + swa_out    # Residual combines both
+    """
+    def __init__(self, cfg: HybridConfig, layer_idx: int = 0):
+        super().__init__()
+        self.cfg = cfg
+        self.layer_idx = layer_idx
+        H, K, V = cfg.n_heads, cfg.head_dim, cfg.value_dim
+        
+        # SHARED key projection - GDN writes and SWA queries use this on SAME x
+        self.shared_key_proj = nn.Linear(cfg.d_model, H * K, bias=False)
+        
+        # GDN components (value, gates, output)
+        self.v_proj = nn.Linear(cfg.d_model, H * V, bias=False)
+        self.gdn_o_proj = nn.Linear(H * V, cfg.d_model, bias=False)
+        
+        self.beta_proj = nn.Linear(cfg.d_model, H, bias=True)
+        nn.init.constant_(self.beta_proj.bias, cfg.beta_bias)
+        
+        self.g_proj = nn.Linear(cfg.d_model, H, bias=True)
+        nn.init.constant_(self.g_proj.bias, cfg.g_bias)
+        
+        # SWA local attention (separate projections - not for state retrieval)
+        self.local_q_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.local_k_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.local_v_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.swa_o_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        
+        # State retrieval output
+        self.retrieval_o_proj = nn.Linear(H * V, cfg.d_model, bias=False)
+        
+        # Retrieval gate
+        self.gate_proj = nn.Linear(cfg.d_model, H, bias=True)
+        nn.init.constant_(self.gate_proj.bias, 1.0)
+        
+        self.norm = RMSNorm(cfg.d_model)
+        self.head_dim = cfg.d_model // cfg.n_heads
+        self.scale = K ** -0.5
+        
+        self.use_shifted_value = getattr(cfg, 'shifted_value', True)
+        self.marker_token = getattr(cfg, 'marker_token', 50251)
+        self.local_drop_prob = getattr(cfg, 'local_drop_prob', 0.7)
+        self.local_scale = getattr(cfg, 'local_scale', 0.3)
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        initial_state: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+        """
+        Parallel GDN + SWA on SAME x.
+        
+        Returns:
+            output: [B, T, D]
+            new_state: [B, H, K, V]
+            diag: diagnostic dict
+        """
+        B, T, D = x.shape
+        H, K, V = self.cfg.n_heads, self.cfg.head_dim, self.cfg.value_dim
+        W = self.cfg.window_size
+        
+        x_norm = self.norm(x)
+        
+        # === SHARED KEY PROJECTION - same for GDN write and SWA query ===
+        k_shared = self.shared_key_proj(x_norm).view(B, T, H, K)
+        k_shared = F.normalize(k_shared.float(), p=2, dim=-1).to(x.dtype)
+        
+        # === GDN: Write to state ===
+        v_full = self.v_proj(x_norm).view(B, T, H, V)
+        
+        beta_floor = getattr(self.cfg, 'beta_floor', 0.1)
+        
+        if self.use_shifted_value and T > 1:
+            k = k_shared[:, :-1]
+            v = v_full[:, 1:]
+            beta = torch.sigmoid(self.beta_proj(x_norm[:, :-1]))
+            g = torch.sigmoid(self.g_proj(x_norm[:, :-1]))
+            
+            if input_ids is not None:
+                marker_mask = (input_ids[:, :-1] == self.marker_token).unsqueeze(-1)
+                beta_scale = beta_floor + (1.0 - beta_floor) * marker_mask.to(beta.dtype)
+                beta = beta * beta_scale
+        else:
+            k = k_shared
+            v = v_full
+            beta = torch.sigmoid(self.beta_proj(x_norm))
+            g = torch.sigmoid(self.g_proj(x_norm))
+            
+            if input_ids is not None:
+                marker_mask = (input_ids == self.marker_token).unsqueeze(-1)
+                beta_scale = beta_floor + (1.0 - beta_floor) * marker_mask.to(beta.dtype)
+                beta = beta * beta_scale
+        
+        if initial_state is None:
+            state = torch.zeros(B, H, K, V, device=x.device, dtype=x.dtype)
+        else:
+            state = initial_state.to(x.dtype)
+        
+        gdn_out, new_state = chunk_delta_rule(k, v, beta, g, state, self.cfg.chunk_size)
+        
+        if self.use_shifted_value and T > 1:
+            zero_pad = torch.zeros(B, 1, H, V, device=x.device, dtype=gdn_out.dtype)
+            gdn_out = torch.cat([zero_pad, gdn_out], dim=1)
+        
+        gdn_out = gdn_out.to(x.dtype).reshape(B, T, H * V)
+        gdn_out = self.gdn_o_proj(gdn_out)
+        
+        # === SWA: Local attention ===
+        q = self.local_q_proj(x_norm).view(B, T, H, self.head_dim)
+        k_local = self.local_k_proj(x_norm).view(B, T, H, self.head_dim)
+        v_local = self.local_v_proj(x_norm).view(B, T, H, self.head_dim)
+        
+        if FLASH_ATTN_AVAILABLE:
+            local_out = flash_attn_func(q, k_local, v_local, causal=True, window_size=(W, 0))
+            local_out = local_out.reshape(B, T, D)
+        else:
+            q = q.transpose(1, 2)
+            k_local = k_local.transpose(1, 2)
+            v_local = v_local.transpose(1, 2)
+            
+            mask = torch.ones(T, T, device=x.device, dtype=torch.bool).triu(1)
+            mask |= torch.ones(T, T, device=x.device, dtype=torch.bool).tril(-W - 1)
+            
+            attn = (q @ k_local.transpose(-2, -1)) * self.scale
+            attn = attn.masked_fill(mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            local_out = (F.softmax(attn, dim=-1) @ v_local).transpose(1, 2).reshape(B, T, D)
+        
+        local_out = self.swa_o_proj(local_out)
+        
+        if self.training:
+            keep_mask = (torch.rand(B, 1, 1, device=x.device) > self.local_drop_prob).to(local_out.dtype)
+            local_out = local_out * keep_mask / (1.0 - self.local_drop_prob)
+        else:
+            local_out = self.local_scale * local_out
+        
+        # === SWA: State retrieval using SAME shared keys as query ===
+        q_g = k_shared.transpose(1, 2)  # [B, H, T, K] - EXACT same as GDN write keys!
+        retrieved = torch.einsum('bhkv,bhtk->bhtv', new_state.to(x.dtype), q_g)
+        retrieved = retrieved.transpose(1, 2).reshape(B, T, H * V)
+        retrieval_out = self.retrieval_o_proj(retrieved)
+        
+        gate = torch.sigmoid(self.gate_proj(x_norm))
+        retrieval_out = gate.mean(dim=-1, keepdim=True) * retrieval_out
+        
+        # === Combine: residual + GDN + local + retrieval ===
+        out = x + gdn_out + local_out + retrieval_out
+        
+        diag = {
+            'beta_mean': beta.mean().item(),
+            'g_mean': g.mean().item(),
+            'state_norm': new_state.norm().item(),
+            'gate_mean': gate.mean().item(),
+            'local_norm': local_out.norm().item(),
+            'retrieval_norm': retrieval_out.norm().item(),
+            'gdn_norm': gdn_out.norm().item(),
+            'layer': 'P',  # Parallel
+            'layer_idx': self.layer_idx,
+        }
+        
+        return out, new_state, diag
+
+
 class TransparentHybrid(nn.Module):
     """
     GDN + SWA hybrid model.
@@ -434,9 +609,10 @@ class TransparentHybrid(nn.Module):
         - SWA provides precision retrieval (window + global via state)
     
     Layer pattern examples:
-        "GS"       - 2 layers: GDN, SWA
+        "GS"       - 2 layers: GDN, SWA (stacked - DEPRECATED, keys misalign)
         "GGS"      - 3 layers: 2 GDN, 1 SWA  
-        "GGSG"     - 4 layers: GDN, GDN, SWA, GDN
+        "P"        - 1 layer: Parallel GDN+SWA (RECOMMENDED)
+        "PP"       - 2 layers: 2x Parallel
     """
     def __init__(self, cfg: HybridConfig):
         super().__init__()
@@ -454,6 +630,8 @@ class TransparentHybrid(nn.Module):
                 self.layers.append(GatedDeltaNetLayer(cfg, i))
             elif lt == 'S':
                 self.layers.append(SlidingWindowAttention(cfg, i))
+            elif lt == 'P':
+                self.layers.append(ParallelHybridLayer(cfg, i))
             else:
                 raise ValueError(f"Unknown layer type: {lt}")
             self.ffns.append(SwiGLUFFN(cfg.d_model))
@@ -486,20 +664,26 @@ class TransparentHybrid(nn.Module):
         key_bank = None  # Will be set by first GDN layer
         all_diag = []
         
-        gdn_k_proj = None  # Will be set by first GDN layer
+        gdn_cached_keys = None  # For legacy stacked mode
         for i, (layer, ffn) in enumerate(zip(self.layers, self.ffns)):
             lt = self.cfg.layer_pattern[i]
-            if lt == 'G':
+            if lt == 'P':
+                # Parallel: GDN+SWA in same layer, both see same x
+                x, state, diag = layer(x, initial_state=state, input_ids=input_ids)
+            elif lt == 'G':
                 # Pass input_ids for MARKER detection and orthogonal key bank
                 x, state, diag = layer(x, initial_state=state, input_ids=input_ids)
                 key_bank = layer.key_bank  # Get bank for SWA to use
-                gdn_k_proj = layer.k_proj  # SHARED key projection for SWA queries
-            else:
-                # Pass input_ids, key_bank, AND shared k_proj for aligned retrieval
-                x, diag = layer(x, gdn_state=state, input_ids=input_ids, key_bank=key_bank, gdn_k_proj=gdn_k_proj)
+                if 'cached_keys' in diag:
+                    gdn_cached_keys = diag.pop('cached_keys')  # Legacy
+            else:  # 'S'
+                # Pass input_ids, key_bank, AND cached keys for aligned retrieval
+                x, diag = layer(x, gdn_state=state, input_ids=input_ids, key_bank=key_bank, gdn_cached_keys=gdn_cached_keys)
             x = ffn(x)
-            diag['layer'] = lt
-            diag['layer_idx'] = i
+            if 'layer' not in diag:
+                diag['layer'] = lt
+            if 'layer_idx' not in diag:
+                diag['layer_idx'] = i
             all_diag.append(diag)
         
         x = self.norm_f(x)
